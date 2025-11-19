@@ -16,7 +16,7 @@ import random
 import glob
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import numpy as np
@@ -43,8 +43,8 @@ except ImportError:
 # --- 1. Baseline Data Functions ---
 
 OUTPUT_DIR = Path("./simulation_outputs_k100")
-DISTRICTS_GEOJSON_PATH = "berlin_districts.geojson"
-DISTRICTS_DOWNLOAD_URL = "https://raw.githubusercontent.com/funkeinteraktiv/Berlin-Geodaten/master/berlin_bezirke.geojson"
+OUTPUT_DIR = Path("./simulation_outputs_k100")
+CHARGERS_GEOJSON_PATH = "chargers_locations.geojson"
 
 POP_BY_DISTRICT = {
     "Mitte": 397134, "Friedrichshain-Kreuzberg": 293454, "Pankow": 424307,
@@ -54,118 +54,65 @@ POP_BY_DISTRICT = {
     "Marzahn-Hellersdorf": 291948, "Lichtenberg": 311881,
     "Reinickendorf": 268792
 }
+
+# BEV Counts from Table I of the Paper
+BEV_BY_DISTRICT = {
+    "Mitte": 8900, "Friedrichshain-Kreuzberg": 7500, "Pankow": 10500,
+    "Charlottenburg-Wilmersdorf": 9800, "Spandau": 4500,
+    "Steglitz-Zehlendorf": 8800, "Tempelhof-Schöneberg": 7200,
+    "Neukölln": 5900, "Treptow-Köpenick": 5500,
+    "Marzahn-Hellersdorf": 4200, "Lichtenberg": 5100,
+    "Reinickendorf": 5400
+}
+
 N_DISTRICTS = len(POP_BY_DISTRICT)
 
-def find_latest_bnetza_file():
-    files = glob.glob("Ladesaeulenregister_BNetzA_*.csv")
-    if not files: return None
-    files.sort()
-    print(f"Using data file: {files[-1]}")
-    return files[-1]
+def canonical_name(name):
+    """Maps variant district names from GeoJSON properties to a canonical name."""
+    key = str(name).strip()
+    if "Friedrichshain" in key and "Kreuzberg" in key: return "Friedrichshain-Kreuzberg"
+    if "Friedrichshain-Kr" in key: return "Friedrichshain-Kreuzberg"
+    if "Mitte" in key: return "Mitte"
+    if "Pankow" in key: return "Pankow"
+    if "Treptow" in key or "Köpenick" in key: return "Treptow-Köpenick"
+    if "Neuk" in key or "Neukölln" in key: return "Neukölln"
+    if "Charlottenburg" in key or "Wilmersdorf" in key: return "Charlottenburg-Wilmersdorf"
+    if "Spandau" in key: return "Spandau"
+    if "Steglitz" in key or "Zehlendorf" in key: return "Steglitz-Zehlendorf"
+    if "Tempelhof" in key or "Schöneberg" in key or "Schoeneberg" in key: return "Tempelhof-Schöneberg"
+    if "Marzahn" in key or "Hellersdorf" in key: return "Marzahn-Hellersdorf"
+    if "Lichtenberg" in key: return "Lichtenberg"
+    if "Reinickendorf" in key: return "Reinickendorf"
+    return key
 
-def download_berlin_districts():
-    if os.path.exists(DISTRICTS_GEOJSON_PATH):
-        print(f"Using existing district file: {DISTRICTS_GEOJSON_PATH}")
-        return True
-    print(f"Downloading Berlin district boundaries from {DISTRICTS_DOWNLOAD_URL}...")
+def prepare_baseline_data_from_geojson(geojson_file_path):
+    print(f"Preparing baseline data from {geojson_file_path}...")
     try:
-        response = requests.get(DISTRICTS_DOWNLOAD_URL, timeout=30)
-        response.raise_for_status()
-        with open(DISTRICTS_GEOJSON_PATH, 'w', encoding='utf-8') as f:
-            f.write(response.text)
-        print(f"✅ District boundaries saved as {DISTRICTS_GEOJSON_PATH}")
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"District download failed: {e}")
-        return False
-
-def find_col(df_columns, possibilities):
-    """Finds the correct column name from a list of possibilities."""
-    for col in possibilities:
-        if col in df_columns:
-            return col
-    # If not found, try lowercase versions robustly
-    possibilities_lower = {p.lower() for p in possibilities}
-    for col in df_columns:
-        if col.lower() in possibilities_lower:
-            return col
-    return None
-
-
-def prepare_baseline_data_from_bneza(bnetza_file_path):
-    try:
-        gdf_districts = gpd.read_file(DISTRICTS_GEOJSON_PATH).to_crs(epsg=4326)
+        gdf = gpd.read_file(geojson_file_path)
+        if gdf.crs is None:
+            gdf.set_crs(epsg=4326, inplace=True)
+        elif gdf.crs.to_epsg() != 4326:
+            gdf = gdf.to_crs(epsg=4326)
     except Exception as e:
-        print(f"❌ CRITICAL: Could not read {DISTRICTS_GEOJSON_PATH}. Error: {e}")
+        print(f"❌ CRITICAL: Could not read {geojson_file_path}. Error: {e}")
         return None
 
-    DISTRICT_COL = 'name' # Correct column in the GeoJSON
-    if DISTRICT_COL not in gdf_districts.columns:
-        print(f"❌ CRITICAL: Could not find district name column '{DISTRICT_COL}' in {DISTRICTS_GEOJSON_PATH}.")
-        print(f"Found columns: {gdf_districts.columns.to_list()}")
-        return None
+    # Filter by date (cutoff 2024-12-31)
+    cutoff = datetime(2024, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    gdf['inbetriebnahme_dt'] = pd.to_datetime(gdf['inbetriebnahme'], errors='coerce', utc=True)
+    gdf_filtered = gdf[gdf['inbetriebnahme_dt'].notna() & (gdf['inbetriebnahme_dt'] <= cutoff)].copy()
+    
+    print(f"Found {len(gdf_filtered)} chargers commissioned by {cutoff.date()}.")
 
-    try:
-        # *** FINAL FIX: Changed header=10 to header=11 ***
-        df_bnetza = pd.read_csv(
-            bnetza_file_path,
-            sep=';',
-            encoding='latin-1',
-            decimal=',',
-            header=11,  # Skip first 11 rows, read headers from row 12 (0-indexed)
-            low_memory=False
-        )
-    except Exception as e:
-        print(f"❌ CRITICAL: Failed to read BNetzA CSV file (using header=11, latin-1). Error: {e}")
-        return None
-
-    # --- Robust Column Finding ---
-    all_cols = df_bnetza.columns
-    # Clean up column names (remove leading/trailing spaces if any)
-    df_bnetza.columns = df_bnetza.columns.str.strip()
-    all_cols = df_bnetza.columns # Update after stripping
-
-    city_col = find_col(all_cols, ['Ort'])
-    date_col = find_col(all_cols, ['Inbetriebnahmedatum'])
-    lat_col = find_col(all_cols, ['Breitengrad'])
-    lon_col = find_col(all_cols, ['Längengrad'])
-    count_col = find_col(all_cols, ['Anzahl Ladepunkte'])
-
-    if not all([city_col, date_col, lat_col, lon_col, count_col]):
-        print("❌ CRITICAL: Could not find one or more required columns AFTER skipping header rows (header=11).")
-        if not city_col: print("   - Missing: 'Ort' (City)")
-        if not date_col: print("   - Missing: 'Inbetriebnahmedatum' (Date)")
-        if not lat_col: print("   - Missing: 'Breitengrad' (Latitude)")
-        if not lon_col: print("   - Missing: 'Längengrad' (Longitude)")
-        if not count_col: print("   - Missing: 'Anzahl Ladepunkte' (Count)")
-        print(f"Found columns in row 12: {all_cols.to_list()}") # Show columns found after skipping
-        return None
-
-    print(f"Using columns: City='{city_col}', Date='{date_col}', Lat='{lat_col}', Lon='{lon_col}', Count='{count_col}'")
-
-    df_berlin = df_bnetza[df_bnetza[city_col] == 'Berlin'].copy()
-
-    df_berlin[date_col] = pd.to_datetime(
-        df_berlin[date_col], dayfirst=True, errors='coerce'
-    )
-    df_berlin = df_berlin.dropna(subset=[date_col])
-    cutoff = datetime(2024, 12, 31)
-    df_berlin_filtered = df_berlin[df_berlin[date_col] <= cutoff].copy()
-
-    df_berlin_filtered[lat_col] = pd.to_numeric(df_berlin_filtered[lat_col], errors='coerce')
-    df_berlin_filtered[lon_col] = pd.to_numeric(df_berlin_filtered[lon_col], errors='coerce')
-    df_berlin_filtered = df_berlin_filtered.dropna(subset=[lat_col, lon_col])
-
-    gdf_points = gpd.GeoDataFrame(
-        df_berlin_filtered,
-        geometry=gpd.points_from_xy(df_berlin_filtered[lon_col], df_berlin_filtered[lat_col]),
-        crs="EPSG:4326"
-    )
-
-    gdf_joined = gpd.sjoin(gdf_points, gdf_districts, how='left', predicate='within')
-
-    # Group by the correct district and count columns
-    canon_counts = gdf_joined.groupby(DISTRICT_COL)[count_col].sum().to_dict()
+    canon_counts = {}
+    for idx, row in gdf_filtered.iterrows():
+        bezirk_raw = row.get('bezirk') or row.get('bezirk_name') or row.get('district') or "Unknown"
+        canon_dist = canonical_name(bezirk_raw)
+        if canon_dist not in POP_BY_DISTRICT: continue
+        
+        num_chargers = pd.to_numeric(row.get('anzahl_ladepunkte'), errors='coerce')
+        if pd.isna(num_chargers) or num_chargers < 1: num_chargers = 1
+        canon_counts[canon_dist] = canon_counts.get(canon_dist, 0) + int(num_chargers)
 
     baseline = []
     for b_name in POP_BY_DISTRICT.keys():
@@ -175,12 +122,12 @@ def prepare_baseline_data_from_bneza(bnetza_file_path):
             "population": POP_BY_DISTRICT[b_name],
         })
     df_base = pd.DataFrame(baseline).set_index("district")
-    total_pop = df_base["population"].sum()
-    df_base["bev_est"] = (50802 * df_base["population"] / total_pop).round().astype(int)
+    
+    df_base["bev_est"] = df_base.index.map(BEV_BY_DISTRICT).fillna(0).astype(int)
     df_base["bev_per_charger_initial"] = df_base["bev_est"] / df_base["existing_chargers"].replace(0, np.nan)
     df_base["bev_per_charger_initial"] = df_base["bev_per_charger_initial"].fillna(df_base["bev_est"])
 
-    print("✅ Baseline data prepared successfully.")
+    print("✅ Baseline data prepared successfully from GeoJSON.")
     return df_base
 
 # --- 2. Simulation Functions ---
@@ -197,37 +144,8 @@ def gini(array):
     g = (n + 1 - 2 * np.sum(cumvals) / cumvals[-1]) / n
     return g
 
-def run_queue_simulation(df_alloc, freq_per_bev_week=0.2, mean_service_minutes=45, seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    period_hours = 7 * 24
-    results = {}
-    for idx, row in df_alloc.iterrows():
-        bev = int(row["bev_est"])
-        servers = int(row["post_chargers"])
-        if servers <= 0:
-            results[idx] = {"avg_wait_min": None}
-            continue
-
-        lam = bev * freq_per_bev_week
-        n_arrivals = np.random.poisson(lam)
-        arrival_times = np.sort(np.random.uniform(0, period_hours, size=n_arrivals))
-        service_times = np.random.exponential(scale=(mean_service_minutes / 60.0), size=n_arrivals)
-
-        server_free = [0.0] * servers
-        waits = []
-        for at, st in zip(arrival_times, service_times):
-            idx_server = min(range(servers), key=lambda i: server_free[i])
-            free_time = server_free[idx_server]
-            wait = max(0.0, free_time - at)
-            start = at + wait
-            finish = start + st
-            server_free[idx_server] = finish
-            waits.append(wait * 60.0)
-
-        avg_wait = float(np.mean(waits)) if waits else 0.0
-        results[idx] = {"avg_wait_min": avg_wait}
-    return results
+# Simulation function removed from optimization loop to align with paper methodology.
+# Simulation will be run separately in the analysis/visualization phase.
 
 # --- 3. NSGA-II Optimization Problem Definition ---
 
@@ -262,17 +180,18 @@ class ChargerAllocationProblem(Problem):
         df_alloc["post_bev_per_charger"] = df_alloc["bev_est"] / df_alloc["post_chargers"].replace(0, np.nan)
         df_alloc["post_bev_per_charger"] = df_alloc["post_bev_per_charger"].fillna(df_alloc["bev_est"])
 
-        # Objective 1: Minimize Gini
+        # Objective 1: Minimize Gini (Equity)
         f1 = gini(df_alloc["post_bev_per_charger"].values)
 
-        # Objective 2: Minimize Average Wait Time
-        sim_res = run_queue_simulation(df_alloc)
-        all_waits = [v["avg_wait_min"] for v in sim_res.values() if v["avg_wait_min"] is not None]
-
-        if not all_waits:
-             f2 = 1e6 # Assign a large penalty if simulation fails
-        else:
-             f2 = np.mean(all_waits)
+        # Objective 2: Maximize Weighted Population Coverage (Utility)
+        # We maximize the sum of (new_chargers * population_of_district)
+        # Since pymoo minimizes, we minimize the negative sum.
+        # This aligns with "placing chargers in areas with high population density".
+        
+        # Note: The paper mentions "pop_coverage(j)" for specific locations. 
+        # As we are optimizing district counts, we use population weighting as the proxy.
+        weighted_coverage = np.sum(x * df_alloc["population"].values)
+        f2 = -1 * weighted_coverage
 
         out["F"] = [f1, f2]
 
@@ -282,15 +201,11 @@ def main():
     OUTPUT_DIR.mkdir(exist_ok=True)
 
     # 1. Load baseline data
-    bnetza_file = find_latest_bnetza_file()
-    if not bnetza_file:
-        print("❌ CRITICAL: No BNetzA file found. Exiting.")
-        return
-    if not download_berlin_districts():
-        print("❌ CRITICAL: Could not download district boundaries. Exiting.")
+    if not os.path.exists(CHARGERS_GEOJSON_PATH):
+        print(f"❌ CRITICAL: {CHARGERS_GEOJSON_PATH} not found. Exiting.")
         return
 
-    df_base = prepare_baseline_data_from_bneza(bnetza_file)
+    df_base = prepare_baseline_data_from_geojson(CHARGERS_GEOJSON_PATH)
     if df_base is None:
         print("❌ CRITICAL: Data preparation failed. Exiting.")
         return
@@ -308,7 +223,7 @@ def main():
             pop_size=100,
             sampling=IntegerRandomSampling(),
             crossover=SBX(prob=0.9, eta=15, vtype=int, repair=RoundingRepair()),
-            mutation=PM(prob=0.1, eta=20, vtype=int, repair=RoundingRepair()),
+            mutation=PM(prob=0.05, eta=20, vtype=int, repair=RoundingRepair()), # Mutation rate 0.05 as per paper
             eliminate_duplicates=True
         )
 
@@ -333,7 +248,7 @@ def main():
                     "Replication": 0,
                     "K": K,
                     "Gini_post": solution_objs[0],
-                    "Weighted_Coverage_Score": solution_objs[1],
+                    "Weighted_Coverage_Score": -1 * solution_objs[1], # Convert back to positive for reporting
                     "Allocation": str(list(solution_vars))
                 })
         else:
@@ -348,7 +263,7 @@ def main():
     print("\n=======================================================")
     print(f"✅ All optimizations complete!")
     print(f"Results saved to: {output_filename}")
-    print("Column 'Weighted_Coverage_Score' contains 'Avg_wait_min'.")
+    print("Column 'Weighted_Coverage_Score' contains the weighted population coverage (Utility).")
     print("=======================================================")
 
 if __name__ == "__main__":

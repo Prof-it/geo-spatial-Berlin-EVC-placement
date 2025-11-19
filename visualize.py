@@ -33,7 +33,7 @@ from folium.plugins import HeatMap
 
 # --- 0. Global Setup ---
 OUTPUT_DIR = Path("./simulation_outputs_final_geojson")
-NSGA2_FILE_PATH = "nsga2_all_k_results.csv"
+NSGA2_FILE_PATH = "nsga2_all_k_results_GENERATED.csv" # Updated to match generator output
 CHARGERS_GEOJSON_PATH = "chargers_locations.geojson" # Use this file
 
 # Population data remains the same
@@ -44,6 +44,16 @@ POP_BY_DISTRICT = {
     "Neukölln": 330017, "Treptow-Köpenick": 294081,
     "Marzahn-Hellersdorf": 291948, "Lichtenberg": 311881,
     "Reinickendorf": 268792
+}
+
+# BEV Counts from Table I of the Paper
+BEV_BY_DISTRICT = {
+    "Mitte": 8900, "Friedrichshain-Kreuzberg": 7500, "Pankow": 10500,
+    "Charlottenburg-Wilmersdorf": 9800, "Spandau": 4500,
+    "Steglitz-Zehlendorf": 8800, "Tempelhof-Schöneberg": 7200,
+    "Neukölln": 5900, "Treptow-Köpenick": 5500,
+    "Marzahn-Hellersdorf": 4200, "Lichtenberg": 5100,
+    "Reinickendorf": 5400
 }
 N_DISTRICTS = len(POP_BY_DISTRICT)
 
@@ -157,7 +167,7 @@ def prepare_baseline_data_from_geojson(geojson_file_path):
     df_base = pd.DataFrame(baseline).set_index("district")
 
     total_pop = df_base["population"].sum()
-    df_base["bev_est"] = (50802 * df_base["population"] / total_pop).round().astype(int)
+    df_base["bev_est"] = df_base.index.map(BEV_BY_DISTRICT).fillna(0).astype(int)
 
     df_base["bev_per_charger_initial"] = df_base["bev_est"] / df_base["existing_chargers"].replace(0, np.nan)
     df_base["bev_per_charger_initial"] = df_base["bev_per_charger_initial"].fillna(df_base["bev_est"])
@@ -444,13 +454,12 @@ def generate_nsga2_plot():
             )
 
         plt.xlabel("Gini Coefficient (Lower is Better)")
-        # Correct label based on how the generator script saves the data
-        plt.ylabel("Average Wait Time (min) (Higher is Worse)")
+        plt.ylabel("Weighted Population Coverage (Higher is Better)")
         plt.title("NSGA-II Pareto Fronts (from nsga2_all_k_results.csv)")
         plt.legend(title="K Values")
         plt.grid(True, linestyle='--', alpha=0.6)
         plt.gca().invert_xaxis() # Gini: Lower is better
-        # Do NOT invert Y axis: Lower wait time is better
+        # Do NOT invert Y axis: Higher coverage is better
 
         plot_filename = OUTPUT_DIR / "nsga2_pareto_fronts_replicated.png"
         plt.savefig(plot_filename, dpi=300, bbox_inches='tight')
